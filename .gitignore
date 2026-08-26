@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Build artifacts (produced by `python -m build`, see .github/workflows/publish.yml)
+dist/
+build/
+
+# Virtualenvs
+.venv/
+venv/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# OS cruft
+.DS_Store
+
+# Secrets -- `make release` stages everything, so keep these excluded
+.env
+*.pem
+*.key

@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "korecord"
+version = "0.1.0"
+description = "Permanent, compressed, searchable recording of terminal sessions (ssh and beyond), built on asciinema."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-3.0-or-later"
+authors = [
+    { name = "Ivan Cherniy" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: Console",
+    "Topic :: System :: Shells",
+    "Topic :: Terminals :: Terminal Emulators/X Terminals",
+]
+dependencies = [
+    "cryptography>=41",
+    "pyte>=0.8",
+    "zstandard>=0.22",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/r4ven-me/korecord"
+Repository = "https://github.com/r4ven-me/korecord"
+Issues = "https://github.com/r4ven-me/korecord/issues"
+
+[project.scripts]
+korec = "korecord.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/korecord"]
