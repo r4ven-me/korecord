@@ -1,17 +1,54 @@
 from __future__ import annotations
 
+import io
 import os
 import signal
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 
-from korecord import db
-from korecord.compress import compress_bytes_to_file, decompress_file
+import korecord
+from korecord import archive, db, ui
+from korecord.cli import (
+    build_parser,
+    cmd_clear,
+    cmd_config_compression_show,
+    cmd_config_encryption_show,
+    cmd_config_show,
+    cmd_rm,
+)
+from korecord.compress import pack_bytes, unpack_bytes
 from korecord.recorder import _descendant_pids
+
+
+def _force_terminal_console(monkeypatch) -> Console:
+    """See test_db.py's copy of this helper for why -- same technique,
+    duplicated rather than shared since it's a few lines and these two
+    test modules don't otherwise import from each other."""
+    console = Console(force_terminal=True, width=200, file=io.StringIO())
+    monkeypatch.setattr(ui, "console", console)
+    return console
+
+
+def _parse(argv):
+    return build_parser().parse_args(argv)
+
+
+def _insert_finished_session(tmp_path, *, name="s"):
+    path = tmp_path / f"{name}.rec"
+    archive.create(path, "cast", pack_bytes(b"unused"))
+    archive.append(path, "txt", pack_bytes(b"unused"))
+    sid = db.insert_pending_session(
+        start="2026-01-01T10:00:00+00:00", local_host="l", remote_host="r",
+        tty="t", path=str(path), pid=os.getpid(),
+    )
+    db.finalize_session(sid, end="2026-01-01T10:01:00+00:00", duration=1, cast_size=1, exit_code=0)
+    return sid, path
 
 
 def _pid_alive(pid: int) -> bool:
@@ -42,6 +79,16 @@ def test_help_exits_zero(tmp_path):
     assert "korec" in result.stdout
 
 
+def test_version_flag_prints_version_and_exits_zero(tmp_path):
+    env = {**os.environ, "KORECORD_DATA_DIR": str(tmp_path)}
+    result = subprocess.run(
+        [sys.executable, "-m", "korecord", "--version"],
+        capture_output=True, text=True, env=env, timeout=15,
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip() == f"korec {korecord.__version__}"
+
+
 def test_unknown_subcommand_fails_cleanly(tmp_path):
     env = {**os.environ, "KORECORD_DATA_DIR": str(tmp_path)}
     result = subprocess.run(
@@ -58,16 +105,15 @@ def test_unknown_subcommand_fails_cleanly(tmp_path):
 # other Unix tool piping into a pager that closes early. -----------------
 def test_cat_piped_into_early_exit_reader_dies_quietly_via_sigpipe(tmp_path, monkeypatch):
     monkeypatch.setenv("KORECORD_DATA_DIR", str(tmp_path))
-    cast_path = tmp_path / "c.cast.zst"
-    txt_path = tmp_path / "c.txt.zst"
-    compress_bytes_to_file(b"unused", cast_path)
+    path = tmp_path / "c.rec"
+    archive.create(path, "cast", pack_bytes(b"unused"))
     # Enough lines that `head -n 1` will have exited and closed the pipe
     # long before `korec cat` finishes writing everything.
     txt = "".join(f"{float(i)}\tline {i}\n" for i in range(20000))
-    compress_bytes_to_file(txt.encode(), txt_path)
+    archive.append(path, "txt", pack_bytes(txt.encode()))
     sid = db.insert_pending_session(
         start="2026-01-01T10:00:00+00:00", local_host="l", remote_host="r",
-        tty="t", cast_path=str(cast_path), txt_path=str(txt_path), pid=os.getpid(),
+        tty="t", path=str(path), pid=os.getpid(),
     )
     db.finalize_session(sid, end="2026-01-01T10:01:00+00:00", duration=60, cast_size=1, exit_code=0)
 
@@ -96,13 +142,12 @@ def test_grep_piped_into_early_exit_reader_dies_quietly_via_sigpipe(tmp_path, mo
     # `head -n 1` reads its one line and exits -- otherwise grep_proc can
     # finish writing (and exit 0) before the pipe ever gets closed on it.
     for i in range(1500):
-        cast_path = tmp_path / f"c{i}.cast.zst"
-        txt_path = tmp_path / f"c{i}.txt.zst"
-        compress_bytes_to_file(b"unused", cast_path)
-        compress_bytes_to_file(f"0.0\tmarker line {i}\n".encode(), txt_path)
+        path = tmp_path / f"c{i}.rec"
+        archive.create(path, "cast", pack_bytes(b"unused"))
+        archive.append(path, "txt", pack_bytes(f"0.0\tmarker line {i}\n".encode()))
         sid = db.insert_pending_session(
             start=f"2026-01-01T10:{i % 60:02d}:00+00:00", local_host="l", remote_host="r",
-            tty="t", cast_path=str(cast_path), txt_path=str(txt_path), pid=os.getpid(),
+            tty="t", path=str(path), pid=os.getpid(),
         )
         db.finalize_session(sid, end="2026-01-01T10:01:00+00:00", duration=60, cast_size=1, exit_code=0)
 
@@ -235,14 +280,21 @@ def test_end_to_end_encrypted_record_grep_cat(tmp_path):
         capture_output=True, text=True, env=base_env, timeout=15,
     )
     session_id = None
-    session_line = ""
     for line in ls_result.stdout.splitlines()[1:]:
         if "enctest" in line:
             session_id = line.split()[0]
-            session_line = line
             break
     assert session_id is not None, ls_result.stdout
-    assert session_line.rstrip().endswith("*")  # the ENC column marker
+
+    # The ENC/COMPRESSED markers in `ls` are cosmetic (and, being blank
+    # rather than a token when off, not reliably positional to parse out
+    # of that table) -- `show`'s `encrypted` field is the actual source
+    # of truth this test cares about.
+    show_result = subprocess.run(
+        [sys.executable, "-m", "korecord", "show", session_id],
+        capture_output=True, text=True, env=base_env, timeout=15,
+    )
+    assert "\nencrypted: 1" in show_result.stdout
 
     cat_result = subprocess.run(
         [sys.executable, "-m", "korecord", "cat", session_id],
@@ -254,22 +306,21 @@ def test_end_to_end_encrypted_record_grep_cat(tmp_path):
     # The actual point: what's on disk must not be plain zstd. Decrypting
     # without a key must fail outright, not just fail to contain the
     # marker as a substring (compressed data wouldn't contain it either).
+    # Unlike the old per-file ".enc" suffix scheme, whether a session is
+    # encrypted no longer shows up in its filename at all (every session
+    # is just `<base>.rec`) -- only the index (`encrypted` field) and,
+    # deliberately, an actual decrypt attempt can tell.
     show_meta = subprocess.run(
         [sys.executable, "-m", "korecord", "show", session_id],
         capture_output=True, text=True, env=base_env, timeout=15,
     )
-    cast_path = next(
-        line.split(": ", 1)[1] for line in show_meta.stdout.splitlines() if line.startswith("cast_path:")
+    rec_path = next(
+        line.split(": ", 1)[1] for line in show_meta.stdout.splitlines() if line.startswith("path:")
     )
-    txt_path = next(
-        line.split(": ", 1)[1] for line in show_meta.stdout.splitlines() if line.startswith("txt_path:")
-    )
-    # Identifiable from the filename alone, not just the index -- useful
-    # for backup tooling that never touches korecord's DB.
-    assert cast_path.endswith(".cast.zst.enc")
-    assert txt_path.endswith(".txt.zst.enc")
+    assert rec_path.endswith(".rec")
+    assert "\nencrypted: 1" in show_meta.stdout
     with pytest.raises(Exception):
-        decompress_file(Path(cast_path))  # no password -- must not silently succeed
+        unpack_bytes(archive.read_member(Path(rec_path), "cast"))  # no password -- must not silently succeed
 
     # Wrong password fails clearly rather than corrupting/hanging.
     wrong_env = {**base_env, "KORECORD_PASSWORD": "not-the-right-password"}
@@ -327,12 +378,14 @@ def test_decrypt_and_encrypt_cli_roundtrip(tmp_path):
         return next(l.split(": ", 1)[1] for l in show_stdout.splitlines() if l.startswith(f"{name}:"))
 
     deadline = time.monotonic() + 15
+    rec_path = None
     while time.monotonic() < deadline:
         show_result = subprocess.run(
             [sys.executable, "-m", "korecord", "show", session_id],
             capture_output=True, text=True, env=base_env, timeout=15,
         )
-        if Path(field(show_result.stdout, "txt_path")).exists():
+        rec_path = Path(field(show_result.stdout, "path"))
+        if rec_path.exists() and archive.has_member(rec_path, "txt"):
             break
         time.sleep(0.2)
     else:
@@ -350,7 +403,7 @@ def test_decrypt_and_encrypt_cli_roundtrip(tmp_path):
         capture_output=True, text=True, env=base_env, timeout=15,
     ).stdout
     assert field(show_after, "encrypted") == "0"
-    assert not field(show_after, "cast_path").endswith(".enc")
+    assert field(show_after, "path") == str(rec_path)  # no rename
 
     # readable with NO password available at all now
     no_password_env = {k: v for k, v in base_env.items() if k != "KORECORD_PASSWORD"}
@@ -373,7 +426,7 @@ def test_decrypt_and_encrypt_cli_roundtrip(tmp_path):
         capture_output=True, text=True, env=base_env, timeout=15,
     ).stdout
     assert field(show_final, "encrypted") == "1"
-    assert field(show_final, "cast_path").endswith(".enc")
+    assert field(show_final, "path") == str(rec_path)  # no rename
 
     cat_final = subprocess.run(
         [sys.executable, "-m", "korecord", "cat", session_id],
@@ -535,3 +588,200 @@ def test_sigterm_to_record_kills_the_whole_recording_tree_and_finalizes_session(
     assert row is not None
     assert row["end_time"] is not None, "session was never finalized after the kill"
     assert row["exit_code"] == -9
+
+
+def test_record_lays_out_files_under_a_per_day_folder(tmp_path):
+    """Recordings are grouped <label>/<year>/<month>/<day>/ -- a day-level
+    folder on top of the previous <year>/<month> layout, so a label used
+    daily (e.g. a frequently-ssh'd host) doesn't dump every session for the
+    whole month into one flat directory."""
+    fake_bin = tmp_path / "fakebin"
+    fake_bin.mkdir()
+    fake_asciinema = fake_bin / "asciinema"
+    fake_asciinema.write_text(_FAKE_ASCIINEMA)
+    fake_asciinema.chmod(0o755)
+
+    data_dir = tmp_path / "data"
+    env = {
+        **os.environ,
+        "KORECORD_DATA_DIR": str(data_dir),
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+    }
+    today = datetime.now().astimezone()
+    result = subprocess.run(
+        [sys.executable, "-m", "korecord", "record", "--label", "daytest", "--", "true"],
+        env=env, capture_output=True, text=True, timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+
+    expected_dir = data_dir / "daytest" / f"{today:%Y}" / f"{today:%m}" / f"{today:%d}"
+    assert expected_dir.is_dir(), f"expected {expected_dir} to exist"
+    assert list(expected_dir.glob("*.rec")), "no .rec archive landed in the per-day folder"
+
+
+# --- `korec rm` / `korec clear` -------------------------------------------
+
+def test_rm_deletes_session_files_and_row(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("KORECORD_DATA_DIR", str(tmp_path))
+    sid, path = _insert_finished_session(tmp_path)
+
+    cmd_rm(_parse(["rm", str(sid)]))
+
+    assert db.get_session(sid) is None
+    assert not path.exists()
+    assert f"session {sid} deleted" in capsys.readouterr().out
+
+
+def test_rm_multiple_ids_deletes_all(tmp_path, monkeypatch):
+    monkeypatch.setenv("KORECORD_DATA_DIR", str(tmp_path))
+    sid1, _ = _insert_finished_session(tmp_path, name="a")
+    sid2, _ = _insert_finished_session(tmp_path, name="b")
+
+    cmd_rm(_parse(["rm", str(sid1), str(sid2)]))
+
+    assert db.get_session(sid1) is None
+    assert db.get_session(sid2) is None
+
+
+def test_rm_unknown_id_exits_cleanly(tmp_path, monkeypatch):
+    monkeypatch.setenv("KORECORD_DATA_DIR", str(tmp_path))
+    with pytest.raises(SystemExit):
+        cmd_rm(_parse(["rm", "999999"]))
+
+
+def test_clear_with_no_sessions_is_a_noop(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("KORECORD_DATA_DIR", str(tmp_path))
+    cmd_clear(_parse(["clear"]))
+    assert "no sessions to delete" in capsys.readouterr().out
+
+
+def test_clear_yes_flag_skips_the_prompt(tmp_path, monkeypatch):
+    monkeypatch.setenv("KORECORD_DATA_DIR", str(tmp_path))
+    sid, path = _insert_finished_session(tmp_path)
+
+    cmd_clear(_parse(["clear", "--yes"]))
+
+    assert db.get_session(sid) is None
+    assert not path.exists()
+
+
+def test_clear_resets_ids_so_the_next_session_starts_at_one_again(tmp_path, monkeypatch):
+    monkeypatch.setenv("KORECORD_DATA_DIR", str(tmp_path))
+    _insert_finished_session(tmp_path, name="a")
+    _insert_finished_session(tmp_path, name="b")
+
+    cmd_clear(_parse(["clear", "--yes"]))
+
+    new_sid, _ = _insert_finished_session(tmp_path, name="after")
+    assert new_sid == 1
+
+
+def test_clear_non_interactive_without_yes_refuses(tmp_path, monkeypatch):
+    """No tty to prompt on and no --yes given -- refuse rather than either
+    silently deleting everything or hanging on a read from a closed
+    stdin."""
+    monkeypatch.setenv("KORECORD_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    sid, _ = _insert_finished_session(tmp_path)
+
+    with pytest.raises(SystemExit):
+        cmd_clear(_parse(["clear"]))
+    assert db.get_session(sid) is not None
+
+
+def test_clear_interactive_prompt_declined_leaves_sessions_untouched(tmp_path, monkeypatch):
+    monkeypatch.setenv("KORECORD_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    sid, _ = _insert_finished_session(tmp_path)
+
+    cmd_clear(_parse(["clear"]))
+
+    assert db.get_session(sid) is not None
+
+
+def test_clear_interactive_prompt_confirmed_deletes_everything(tmp_path, monkeypatch):
+    monkeypatch.setenv("KORECORD_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "yes")
+    sid1, _ = _insert_finished_session(tmp_path, name="a")
+    sid2, _ = _insert_finished_session(tmp_path, name="b")
+
+    cmd_clear(_parse(["clear"]))
+
+    assert db.get_session(sid1) is None
+    assert db.get_session(sid2) is None
+
+
+def test_clear_skips_running_session_without_force(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("KORECORD_DATA_DIR", str(tmp_path))
+    finished_sid, _ = _insert_finished_session(tmp_path, name="fin")
+    raw_path = tmp_path / "run.cast"
+    raw_path.write_bytes(b'{"version": 2, "width": 80, "height": 24}\n')
+    running_sid = db.insert_pending_session(
+        start="2026-01-01T10:00:00+00:00", local_host="l", remote_host="r",
+        tty="t", path=str(tmp_path / "run.rec"), pid=os.getpid(),
+    )
+
+    cmd_clear(_parse(["clear", "--yes"]))
+
+    assert db.get_session(finished_sid) is None
+    assert db.get_session(running_sid) is not None
+    assert "skipped 1 still recording" in capsys.readouterr().out
+
+
+def test_clear_force_deletes_running_sessions_too(tmp_path, monkeypatch):
+    monkeypatch.setenv("KORECORD_DATA_DIR", str(tmp_path))
+    raw_path = tmp_path / "run.cast"
+    raw_path.write_bytes(b'{"version": 2, "width": 80, "height": 24}\n')
+    running_sid = db.insert_pending_session(
+        start="2026-01-01T10:00:00+00:00", local_host="l", remote_host="r",
+        tty="t", path=str(tmp_path / "run.rec"), pid=os.getpid(),
+    )
+
+    cmd_clear(_parse(["clear", "--yes", "--force"]))
+
+    assert db.get_session(running_sid) is None
+    assert not raw_path.exists()
+
+
+# --- pretty (rich) vs. plain output ----------------------------------------
+#
+# `korec ls`/`show` have their own dedicated coverage in test_db.py (that's
+# where the actual rendering lives); these just confirm the config-status
+# commands in cli.py follow the same is_terminal-gated pattern.
+
+def test_config_show_pretty_mode_renders_a_boxed_table(tmp_path, monkeypatch):
+    monkeypatch.setenv("KORECORD_DATA_DIR", str(tmp_path))
+    console = _force_terminal_console(monkeypatch)
+
+    cmd_config_show(_parse(["config", "show"]))
+
+    out = console.file.getvalue()
+    assert "\x1b[" in out
+    assert "╭" in out and "╰" in out
+    assert "config file" in out
+
+
+def test_config_encryption_show_pretty_mode_renders_a_boxed_table(tmp_path, monkeypatch):
+    monkeypatch.setenv("KORECORD_DATA_DIR", str(tmp_path))
+    console = _force_terminal_console(monkeypatch)
+
+    cmd_config_encryption_show(_parse(["config", "encryption", "show"]))
+
+    out = console.file.getvalue()
+    assert "\x1b[" in out
+    assert "╭" in out and "╰" in out
+    assert "disabled" in out
+
+
+def test_config_compression_show_pretty_mode_renders_a_boxed_table(tmp_path, monkeypatch):
+    monkeypatch.setenv("KORECORD_DATA_DIR", str(tmp_path))
+    console = _force_terminal_console(monkeypatch)
+
+    cmd_config_compression_show(_parse(["config", "compression", "show"]))
+
+    out = console.file.getvalue()
+    assert "\x1b[" in out
+    assert "╭" in out and "╰" in out
+    assert "enabled" in out

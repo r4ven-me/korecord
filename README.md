@@ -3,7 +3,7 @@
 Permanent, compressed, searchable recording of terminal sessions (ssh and
 beyond), built on top of [asciinema](https://asciinema.org/).
 
-- Compresses every recording to a zstd `.cast.zst` file.
+- Compresses every recording to a single zstd-compressed `.rec` archive.
 - Builds a searchable plaintext transcript per session by replaying the
   recording through a real terminal emulator ([pyte](https://github.com/selectel/pyte)),
   so redraws (shell autosuggestions, fancy prompts, progress bars) collapse
@@ -62,7 +62,9 @@ korec record -- ssh myhost
 # or the program name for anything else)
 korec record --label prod-db -- ssh myhost
 
-# list recorded sessions, newest first
+# list recorded sessions, newest first. ENC and COMPRESSED show whether
+# that particular session is encrypted/compressed -- independent
+# settings, recorded per session, not just whatever's currently configured
 korec ls
 korec ls --host myhost --limit 20
 
@@ -85,7 +87,21 @@ korec show 42
 
 # view or change where recordings are stored (see below)
 korec config show
+korec config encryption show
+korec config compression show
+
+# permanently delete one or more sessions -- files and index row both
+korec rm 42
+korec rm 42 43 44
+
+# permanently delete every session -- prompts for confirmation unless --yes
+# (also resets session ids back to starting at 1, since the index is now
+# fully empty)
+korec clear
+korec clear --yes   # for scripting; refused if stdin isn't a tty and this is omitted
 ```
+
+`ls`, `show`, the three `config ... show` commands, and `--help` at every level all render as colored, bordered tables ([rich](https://github.com/Textualize/rich)/[rich-argparse](https://github.com/hamdanal/rich-argparse)) in a real terminal. Piped, redirected, or otherwise not connected to one, they fall back to the same plain, fixed-width/`key: value` text they've always produced -- a script parsing `korec ls`/`show` output never has to deal with ANSI codes or box-drawing characters, or change anything about how it parses them.
 
 ## What gets saved, and where
 
@@ -98,13 +114,10 @@ location](#changing-the-storage-location) to point it somewhere else.
   <label>/
     <year>/
       <month>/
-        <timestamp>_<tty>_<pid>.cast.zst[.enc]   # full asciicast recording, zstd-compressed
-        <timestamp>_<tty>_<pid>.txt.zst[.enc]    # searchable plaintext transcript, zstd-compressed
-  index.db                                   # SQLite index of every session
+        <day>/
+          <timestamp>_<tty>_<pid>.rec   # one archive per session
+  index.db                          # SQLite index of every session
 ```
-
-`.enc` only appears when [encryption](#optional-encryption) was on for that
-particular recording.
 
 - **`<label>`** is the recording's grouping key -- by default the ssh
   target host (`ssh myhost` -> `myhost`), or the program name for any other
@@ -113,36 +126,45 @@ particular recording.
   e.g. `2026-08-17_224255_pts_3_48213`, so filenames sort chronologically
   and the pid guarantees no collision even if two sessions somehow start in
   the same second with no distinguishable tty.
-- **Exactly two files per session, once it's finished** -- `*.cast.zst` and
-  `*.txt.zst` -- regardless of how long the session runs or how much
-  output it produces. There's no per-hour or per-block splitting: a
-  session that runs for 10 seconds and one that runs for 20 hours both
-  produce one `.cast.zst` and one `.txt.zst`.
-- **`*.cast.zst`** is the raw [asciicast v2](https://docs.asciinema.org/manual/asciicast/v2/)
-  recording (every byte of terminal output plus timestamps), zstd-compressed.
-  This is what `korec play <id>` replays. asciinema itself writes straight
-  to a plain, uncompressed file as the session runs (a real file is
-  required -- there's no more streaming to stdout, see
-  [crash safety](#long-running-sessions-and-crash-safety)); once the
-  session ends, `korec` compresses that file in one pass into `.cast.zst`
-  and deletes the plain copy.
-- **`*.txt.zst` does not exist until the session ends**, and is built in
-  one pass by replaying the finished recording through a real terminal
-  emulator (`pyte`) and dumping the final screen contents -- rendering
-  happens in a detached background process right after the session ends
-  (so closing the terminal doesn't cut it off). That said, `korec
-  grep`/`korec cat` don't just wait for it: for a still-running session
-  neither file exists yet either, so both render on the fly, straight from
-  whatever asciinema has flushed to the plain (uncompressed) recording so
-  far -- a live session is fully searchable, just slower than reading the
-  pre-built sidecar.
+- **Exactly one `.rec` file per session**, regardless of how long it runs,
+  how much output it produces, whether [compression](#optional-compression)
+  or [encryption](#optional-encryption) are on, or any combination of the
+  two -- none of that shows up in the filename; `korec show <id>` (or the
+  index directly) is the only place that's recorded. A `.rec` file is a
+  plain (uncompressed) tar archive with up to two members inside:
+  - **`cast`** -- the raw [asciicast v2](https://docs.asciinema.org/manual/asciicast/v2/)
+    recording (every byte of terminal output plus timestamps). This is what
+    `korec play <id>` replays. asciinema itself writes straight to a plain,
+    uncompressed file as the session runs (a real file is required --
+    there's no more streaming to stdout, see [crash
+    safety](#long-running-sessions-and-crash-safety)); once the session
+    ends, `korec` packs that file in one pass into the `cast` member and
+    deletes the plain copy -- the session is playable from this point on,
+    even before the next step below finishes.
+  - **`txt`** -- the searchable plaintext transcript, appended once it's
+    built (it does not exist right when the session ends) by replaying the
+    finished recording through a real terminal emulator (`pyte`) and
+    dumping the final screen contents. Rendering happens in a detached
+    background process right after the session ends (so closing the
+    terminal doesn't cut it off), and appends this member to the archive
+    without touching the `cast` one already there. That said, `korec
+    grep`/`korec cat` don't just wait for it: for a still-running session
+    the archive doesn't exist yet either, so both render on the fly,
+    straight from whatever asciinema has flushed to the plain (uncompressed)
+    recording so far -- a live session is fully searchable, just slower
+    than reading the pre-built transcript.
+  - Each member is independently zstd-compressed (unless
+    [compression](#optional-compression) is off) and then, if
+    [encryption](#optional-encryption) is on for that session, AES-256-GCM
+    encrypted -- see those sections for what that means for the byte layout.
 - **`index.db`** is a small SQLite database with one row per session:
-  start/end time, duration, local host, label, tty, `.cast.zst` size, and
-  the recorded command's exit code. `korec ls` and `korec show <id>` read
-  from it; it's what makes sessions easy to find without opening every
-  recording. A row is written the moment recording *starts*, not when it
-  ends, so a still-running session already shows up in `korec ls` (as
-  `STATUS RUNNING`) instead of only appearing after you disconnect.
+  start/end time, duration, local host, label, tty, the `.rec` file's size,
+  the recorded command's exit code, and whether that session is compressed/
+  encrypted. `korec ls` and `korec show <id>` read from it; it's what makes
+  sessions easy to find without opening every recording. A row is written
+  the moment recording *starts*, not when it ends, so a still-running
+  session already shows up in `korec ls` (as `STATUS RUNNING`) instead of
+  only appearing after you disconnect.
 
 Recordings are kept forever by default -- nothing is ever deleted or
 rotated automatically. Typical size for an interactive session, after
@@ -189,15 +211,20 @@ damage:
   like a nested `ssh`), and finishes the session normally -- it's finalized
   with a real duration and an exit code reflecting the kill, instead of
   surviving indefinitely with no controlling terminal attached to it.
+- Whatever a session's status, `korec rm <id>` deletes it -- files and
+  index row -- for good. It refuses a session that's still genuinely
+  recording (its `pid` is alive) so you don't delete files out from under
+  a live asciinema process; `--force` overrides that. A `KILLED?` session
+  (recorder already dead, see above) deletes fine without `--force`.
 
 Two costs scale with session length. First, right after a session ends,
-`korec` reads the whole plain recording into memory to compress it in one
-shot (then deletes the plain copy) -- for ordinary interactive use that's
-negligible, but a session with sustained heavy output (`tail -f` on a busy
-log, `htop` left running for a day) can make that a real amount of memory,
-however briefly. Second, and larger: the `.txt.zst` transcript is built by
-fully replaying the session through `pyte`, a pure-Python terminal
-emulator, in one pass after the session ends. That's fast for ordinary
+`korec` reads the whole plain recording into memory to pack it into the
+archive's `cast` member in one shot (then deletes the plain copy) -- for
+ordinary interactive use that's negligible, but a session with sustained
+heavy output (`tail -f` on a busy log, `htop` left running for a day) can
+make that a real amount of memory, however briefly. Second, and larger:
+the `txt` member is built by fully replaying the session through `pyte`, a
+pure-Python terminal emulator, in one pass after the session ends. That's fast for ordinary
 interactive use, but a session like that can reach hundreds of thousands of
 lines, and rendering that can take minutes and hold a non-trivial amount of
 memory while it runs. Neither blocks the recording itself or the
@@ -262,15 +289,17 @@ korec decrypt 42   # -> plain, no password needed for it ever again
 korec encrypt 42   # -> encrypted with the currently configured password
 ```
 
-Off by default. When on, both a session's `.cast.zst` and `.txt.zst` are
-encrypted (AES-256-GCM, key derived from the password via scrypt) --
-`korec record`/`grep`/`cat`/`play` all handle it transparently, prompting
-for the password if it isn't available some other way. `korec config
-encryption enable`/`disable` only decide what *future* recordings do;
-`korec decrypt <id>`/`korec encrypt <id>` change one already-recorded
-session directly -- rewriting its `.cast.zst[.enc]`/`.txt.zst[.enc]` files
-in place and flipping its `encrypted` flag in the index (visible as the
-`ENC` column in `korec ls`).
+Off by default. When on, both of a session's archive members (`cast` and,
+once built, `txt` -- see [What gets saved, and
+where](#what-gets-saved-and-where)) are encrypted (AES-256-GCM, key derived
+from the password via scrypt) -- `korec record`/`grep`/`cat`/`play` all
+handle it transparently, prompting for the password if it isn't available
+some other way. `korec config encryption enable`/`disable` only decide
+what *future* recordings do; `korec decrypt <id>`/`korec encrypt <id>`
+change one already-recorded session directly -- rewriting its `.rec`
+archive in place (same filename, same location, nothing to rename) and
+flipping its `encrypted` flag in the index (visible as the `ENC` column in
+`korec ls`).
 
 **The password alone is always enough to decrypt -- nothing else to keep
 track of or back up.** Every encrypted file carries its own randomly
@@ -301,41 +330,67 @@ yours, use `--no-store-password` (or just say no at the prompt) and rely on
 `$KORECORD_PASSWORD` or an interactive prompt instead.
 
 A password is only ever needed to read the *rendered artifacts* of a
-finished session (`.cast.zst.enc`/`.txt.zst.enc` -- an encrypted session's
-files get an extra `.enc` on top of the usual `.cast.zst`/`.txt.zst`, so
-they're identifiable straight from a file listing without consulting the
-index). A session that's still recording reads from the plain file
-asciinema itself writes live, which is never encrypted regardless of this
-setting -- asciinema has no idea korec might encrypt the finished result --
-so `korec grep`/`cat` on a live session never need a password, encrypted or
-not.
+finished session. Unlike an earlier version of this scheme, that's no
+longer identifiable from the filename at all -- an encrypted session's
+`.rec` looks exactly like a plain one from a file listing; only the index
+(`korec show <id>`'s `encrypted` field, the `ENC` column in `korec ls`) or
+an actual decrypt attempt can tell. A session that's still recording reads
+from the plain file asciinema itself writes live, which is never encrypted
+regardless of this setting -- asciinema has no idea korec might encrypt the
+finished result -- so `korec grep`/`cat` on a live session never need a
+password, encrypted or not.
 
 `korec record` resolves the password once, up front, in the foreground
 (where it's safe to prompt); the detached background process that builds
-the `.txt.zst.enc` transcript gets that same password passed via an
-environment variable, never via a command-line argument (which would leak
-into `ps`/process listings).
+the `txt` member gets that same password passed via an environment
+variable, never via a command-line argument (which would leak into
+`ps`/process listings).
 
 ### Decrypting without korecord
 
 [`scripts/decrypt-recording.py`](scripts/decrypt-recording.py) decrypts a
-`.cast.zst.enc`/`.txt.zst.enc` file on its own -- it doesn't import or
-require korecord at all, only the `cryptography` package (`pip install
-cryptography`) and a `zstd` binary on `$PATH`. Useful if korecord itself is
+session's `.rec` archive on its own -- it doesn't import or require
+korecord at all, only the `cryptography` package (`pip install
+cryptography`) and a `zstd` binary on `$PATH` (the standard library's
+`tarfile` module handles the archive itself). Useful if korecord itself is
 ever broken, gone, or unavailable and you just need the data back:
 
 ```sh
-python3 scripts/decrypt-recording.py session.txt.zst.enc
+python3 scripts/decrypt-recording.py session.rec
 # prompts for the password (or reads $KORECORD_PASSWORD); writes
-# session.txt next to it by default -- nothing else needed
+# session.cast and, if the transcript had finished rendering, session.txt
+# next to it by default -- nothing else needed
 ```
 
-The file format itself (documented at the top of that script, and in
-[`crypto.py`](src/korecord/crypto.py)) is nothing exotic: a random 16-byte
-salt and 12-byte nonce followed by AES-256-GCM ciphertext, keyed by
-`scrypt(password, salt, n=2**14, r=8, p=1, dklen=32)`, wrapping ordinary
-zstd-compressed data -- reproducible with any standard crypto library if
-you'd rather not use the provided script.
+Each archive member's format itself (documented at the top of that script,
+and in [`crypto.py`](src/korecord/crypto.py)) is nothing exotic: a random
+16-byte salt and 12-byte nonce followed by AES-256-GCM ciphertext, keyed by
+`scrypt(password, salt, n=2**14, r=8, p=1, dklen=32)`, wrapping zstd
+-compressed data (or, if [compression](#optional-compression) was off for
+that session, the plain bytes directly -- the script tells the two apart by
+sniffing zstd's frame magic number, since that's not recorded anywhere the
+script can reach) -- reproducible with any standard crypto library if you'd
+rather not use the provided script.
+
+## Optional compression
+
+```sh
+# check status
+korec config compression show
+
+# turn off for future recordings -- trades disk space for raw write
+# throughput, e.g. a very high-output session on a slow machine where
+# the zstd pass itself becomes the bottleneck
+korec config compression disable
+
+# back on (the default)
+korec config compression enable
+```
+
+On by default, independently of [encryption](#optional-encryption) --
+either, both, or neither can apply to a given session, and each session
+records which way it was actually written (visible via `korec show <id>`),
+not just whatever's currently configured.
 
 ## Terminal-emulator integration (e.g. Tilix)
 
@@ -381,3 +436,7 @@ before the first release:
 2. In the GitHub repo, under *Settings -> Environments*, create an
    environment named `pypi` (optionally with protection rules, e.g.
    restricting it to tag pushes).
+
+## Author
+
+Developed by [Ivan Cherniy](https://github.com/r4ven-me).

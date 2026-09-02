@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import getpass
 import os
 import signal
 import sys
 from pathlib import Path
 
-from . import config, db, recorder, render
+from rich.text import Text
+from rich_argparse import RichHelpFormatter
+
+from . import __version__, config, db, recorder, render, ui
+
+# Every subparser (including nested ones under `config`) gets this, so
+# `-h`/`--help` looks the same everywhere -- see `_rich_parser`'s use in
+# every `add_subparsers(parser_class=...)` call below.
+_rich_parser = functools.partial(argparse.ArgumentParser, formatter_class=RichHelpFormatter)
 
 
 def cmd_record(args: argparse.Namespace) -> None:
@@ -40,6 +49,36 @@ def cmd_show(args: argparse.Namespace) -> None:
     db.print_session(args.id)
 
 
+def cmd_rm(args: argparse.Namespace) -> None:
+    for session_id in args.id:
+        db.delete_session(session_id, force=args.force)
+        print(f"korec: session {session_id} deleted")
+
+
+def cmd_clear(args: argparse.Namespace) -> None:
+    ids = db.all_session_ids()
+    if not ids:
+        print("korec: no sessions to delete")
+        return
+
+    if not args.yes:
+        if not sys.stdin.isatty():
+            sys.exit("korec: refusing to clear all sessions non-interactively without --yes")
+        answer = input(
+            f"This will permanently delete all {len(ids)} session(s) -- recordings and "
+            "transcripts included -- with no way to undo it. Continue? [y/N]: "
+        ).strip().lower()
+        if answer not in ("y", "yes"):
+            print("korec: cancelled")
+            return
+
+    deleted, skipped = db.delete_all_sessions(force=args.force)
+    msg = f"korec: deleted {deleted} session(s)"
+    if skipped:
+        msg += f", skipped {skipped} still recording (use --force to delete them too)"
+    print(msg)
+
+
 def cmd_decrypt(args: argparse.Namespace) -> None:
     db.decrypt_session(args.id)
 
@@ -49,26 +88,38 @@ def cmd_encrypt(args: argparse.Namespace) -> None:
 
 
 def cmd_render_internal(args: argparse.Namespace) -> None:
-    # Whether *this* session is encrypted comes from `--encrypted` (set by
-    # `record()` from the session's own `encrypted` flag), not from
-    # whether a password happens to be resolvable -- $KORECORD_PASSWORD
-    # could be sitting in the ambient environment for unrelated reasons,
-    # and using that alone would risk wrongly encrypting a plain session's
-    # transcript. The password itself, when it *is* needed, travels the
-    # same way: via $KORECORD_PASSWORD (the same var resolve_password()
-    # already checks first anywhere else) rather than argv, so it doesn't
-    # show up in `ps`/process listings. prompt_if_missing=False because
-    # this runs detached with no stdin to prompt on anyway.
+    # Whether *this* session is encrypted/compressed comes from
+    # `--encrypted`/`--compressed` (set by `record()` from the session's
+    # own flags), not from whether a password happens to be resolvable --
+    # $KORECORD_PASSWORD could be sitting in the ambient environment for
+    # unrelated reasons, and using that alone would risk wrongly
+    # encrypting a plain session's transcript. The password itself, when
+    # it *is* needed, travels the same way: via $KORECORD_PASSWORD (the
+    # same var resolve_password() already checks first anywhere else)
+    # rather than argv, so it doesn't show up in `ps`/process listings.
+    # prompt_if_missing=False because this runs detached with no stdin to
+    # prompt on anyway.
     password = config.resolve_password(prompt_if_missing=False) if args.encrypted else None
-    render.render_cast_to_text(Path(args.cast), Path(args.txt), password=password)
+    render.render_cast_member_to_txt(Path(args.path), compressed=args.compressed, password=password)
 
 
 def cmd_config_show(args: argparse.Namespace) -> None:
-    print(f"config file:  {config.config_file()}")
-    print(f"data dir:     {config.data_dir()}")
-    print(f"index db:     {config.db_path()}")
-    if os.environ.get("KORECORD_DATA_DIR"):
-        print("(data dir is currently overridden by $KORECORD_DATA_DIR)")
+    overridden = bool(os.environ.get("KORECORD_DATA_DIR"))
+    if not ui.console.is_terminal:
+        print(f"config file:  {config.config_file()}")
+        print(f"data dir:     {config.data_dir()}")
+        print(f"index db:     {config.db_path()}")
+        if overridden:
+            print("(data dir is currently overridden by $KORECORD_DATA_DIR)")
+        return
+
+    ui.print_kv_table([
+        ("config file", str(config.config_file())),
+        ("data dir", str(config.data_dir())),
+        ("index db", str(config.db_path())),
+    ])
+    if overridden:
+        ui.console.print("(data dir is currently overridden by $KORECORD_DATA_DIR)", style="dim")
 
 
 def cmd_config_set_data_dir(args: argparse.Namespace) -> None:
@@ -84,11 +135,23 @@ def cmd_config_unset_data_dir(args: argparse.Namespace) -> None:
 
 def cmd_config_encryption_show(args: argparse.Namespace) -> None:
     enabled = config.encryption_enabled()
-    print(f"encryption: {'enabled' if enabled else 'disabled'} (for future recordings)")
     stored = config.encryption_stored_password() is not None
-    print(f"password stored in config file: {'yes' if stored else 'no'}")
+
+    if not ui.console.is_terminal:
+        print(f"encryption: {'enabled' if enabled else 'disabled'} (for future recordings)")
+        print(f"password stored in config file: {'yes' if stored else 'no'}")
+        if not stored:
+            print("(korec will use $KORECORD_PASSWORD or prompt interactively when a password is needed)")
+        return
+
+    ui.print_kv_table([
+        ("encryption", Text("enabled", style="green") if enabled else Text("disabled", style="dim")),
+        ("password stored", Text("yes", style="green") if stored else Text("no", style="dim")),
+    ])
     if not stored:
-        print("(korec will use $KORECORD_PASSWORD or prompt interactively when a password is needed)")
+        ui.console.print(
+            "(korec will use $KORECORD_PASSWORD or prompt interactively when a password is needed)", style="dim",
+        )
 
 
 def cmd_config_encryption_enable(args: argparse.Namespace) -> None:
@@ -132,12 +195,35 @@ def cmd_config_encryption_disable(args: argparse.Namespace) -> None:
     print("(existing encrypted sessions are unaffected and still need the password to read)")
 
 
+def cmd_config_compression_show(args: argparse.Namespace) -> None:
+    enabled = config.compression_enabled()
+    if not ui.console.is_terminal:
+        print(f"compression: {'enabled' if enabled else 'disabled'} (for future recordings)")
+        return
+    ui.print_kv_table([
+        ("compression", Text("enabled", style="green") if enabled else Text("disabled", style="dim")),
+    ])
+
+
+def cmd_config_compression_enable(args: argparse.Namespace) -> None:
+    config.set_compression(True)
+    print("korec: compression enabled for future recordings.")
+
+
+def cmd_config_compression_disable(args: argparse.Namespace) -> None:
+    config.set_compression(False)
+    print("korec: compression disabled for future recordings.")
+    print("(existing recordings are unaffected either way)")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="korec",
         description="Permanent, compressed, searchable recording of terminal sessions.",
+        formatter_class=RichHelpFormatter,
     )
-    sub = p.add_subparsers(dest="cmd", required=True)
+    p.add_argument("--version", action="version", version=f"korec {__version__}")
+    sub = p.add_subparsers(dest="cmd", required=True, parser_class=_rich_parser)
 
     pr = sub.add_parser(
         "record",
@@ -172,6 +258,16 @@ def build_parser() -> argparse.ArgumentParser:
     ps.add_argument("id", type=int)
     ps.set_defaults(func=cmd_show)
 
+    prm = sub.add_parser("rm", help="Permanently delete one or more sessions (files and index row)")
+    prm.add_argument("id", type=int, nargs="+")
+    prm.add_argument("--force", action="store_true", help="Delete even if the session is still actively recording")
+    prm.set_defaults(func=cmd_rm)
+
+    pclear = sub.add_parser("clear", help="Permanently delete ALL sessions -- prompts for confirmation")
+    pclear.add_argument("--yes", action="store_true", help="Skip the confirmation prompt (for scripting)")
+    pclear.add_argument("--force", action="store_true", help="Also delete sessions that are still actively recording")
+    pclear.set_defaults(func=cmd_clear)
+
     pdecrypt = sub.add_parser(
         "decrypt", help="Permanently decrypt one session's stored files in place (no more password needed for it)"
     )
@@ -185,7 +281,7 @@ def build_parser() -> argparse.ArgumentParser:
     pencrypt.set_defaults(func=cmd_encrypt)
 
     pc = sub.add_parser("config", help="View or change where recordings are stored")
-    csub = pc.add_subparsers(dest="config_cmd", required=True)
+    csub = pc.add_subparsers(dest="config_cmd", required=True, parser_class=_rich_parser)
 
     csub.add_parser("show", help="Show the active config file and data directory").set_defaults(func=cmd_config_show)
 
@@ -196,7 +292,7 @@ def build_parser() -> argparse.ArgumentParser:
     csub.add_parser("unset-data-dir", help="Revert to the default storage directory").set_defaults(func=cmd_config_unset_data_dir)
 
     penc = csub.add_parser("encryption", help="Manage optional password-based encryption of recordings")
-    encsub = penc.add_subparsers(dest="encryption_cmd", required=True)
+    encsub = penc.add_subparsers(dest="encryption_cmd", required=True, parser_class=_rich_parser)
 
     encsub.add_parser(
         "show", help="Show whether encryption is on and whether a password is stored"
@@ -215,12 +311,27 @@ def build_parser() -> argparse.ArgumentParser:
         "disable", help="Turn off encryption for future recordings (existing encrypted sessions are unaffected)"
     ).set_defaults(func=cmd_config_encryption_disable)
 
+    pcomp = csub.add_parser("compression", help="Manage zstd compression of recordings (on by default)")
+    compsub = pcomp.add_subparsers(dest="compression_cmd", required=True, parser_class=_rich_parser)
+
+    compsub.add_parser(
+        "show", help="Show whether compression is currently on"
+    ).set_defaults(func=cmd_config_compression_show)
+
+    compsub.add_parser(
+        "enable", help="Turn compression back on for future recordings (the default)"
+    ).set_defaults(func=cmd_config_compression_enable)
+
+    compsub.add_parser(
+        "disable", help="Turn off compression for future recordings -- trades disk space for raw write throughput"
+    ).set_defaults(func=cmd_config_compression_disable)
+
     # Internal: invoked by `record` as a detached background process to
     # build the searchable transcript sidecar. Not meant for direct use.
     pi = sub.add_parser("_render", help=argparse.SUPPRESS)
-    pi.add_argument("cast")
-    pi.add_argument("txt")
+    pi.add_argument("path")
     pi.add_argument("--encrypted", action="store_true")
+    pi.add_argument("--compressed", action=argparse.BooleanOptionalAction, default=True)
     pi.set_defaults(func=cmd_render_internal)
 
     return p

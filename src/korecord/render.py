@@ -14,7 +14,8 @@ import pyte
 from pyte.screens import Margins
 from wcwidth import wcwidth
 
-from .compress import compress_bytes_to_file, decompress_file
+from . import archive
+from .compress import pack_bytes, unpack_bytes
 
 HISTORY_LINES = 5_000_000
 
@@ -167,18 +168,20 @@ def render_raw_cast(raw: str) -> str:
     return "".join(f"{t:.3f}\t{text}\n" for t, text in out_lines)
 
 
-def render_cast_to_text(cast_path: Path, txt_path: Path, password: str | None = None) -> None:
-    """`password`, if given, is used both to decrypt `cast_path` and to
-    encrypt the resulting `txt_path` -- the two files of a given session
-    are either both encrypted or both plain, never mixed. Each file gets
-    its own independently-generated salt (see crypto.py) even though they
+def render_cast_member_to_txt(path: Path, *, compressed: bool, password: str | None = None) -> None:
+    """Reads the "cast" member out of a session's `.rec` archive at `path`,
+    builds its searchable transcript, and appends it back as a "txt"
+    member -- packed the same way (`compressed`/`password`) as the cast
+    member already is, so the two stay consistent. Each member gets its
+    own independently-generated salt (see crypto.py) even though they
     share the same password -- no retry-on-wrong-password here, unlike
-    compress.py's decrypt_file_with_retry: this runs as a detached
+    compress.py's unpack_bytes_with_retry: this runs as a detached
     background process with no stdin to prompt on, so there'd be nothing
     to retry with anyway."""
     try:
-        raw = decompress_file(cast_path, password=password).decode("utf-8", "replace")
+        blob = archive.read_member(path, "cast")
+        raw = unpack_bytes(blob, compressed=compressed, password=password).decode("utf-8", "replace")
+        text = render_raw_cast(raw)
     except Exception:
-        compress_bytes_to_file(b"", txt_path, password=password)
-        return
-    compress_bytes_to_file(render_raw_cast(raw).encode("utf-8"), txt_path, password=password)
+        text = ""
+    archive.append(path, "txt", pack_bytes(text.encode("utf-8"), compress=compressed, password=password))

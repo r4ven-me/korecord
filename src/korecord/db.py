@@ -1,6 +1,7 @@
 """SQLite index of recorded sessions: one row per recording, pointing at
-its compressed asciicast and (once background rendering finishes) its
-searchable plaintext sidecar.
+its `.rec` archive -- a tar container (see archive.py) holding the
+asciicast recording and, once background rendering finishes, its
+searchable plaintext transcript.
 
 A row is inserted as soon as recording *starts* (end_time/exit_code/etc.
 left NULL) and filled in when it ends, so a session is visible in `ls`
@@ -15,10 +16,13 @@ import sqlite3
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable
 
-from . import config
-from .compress import compress_bytes_to_file, decompress_file, decrypt_file_with_retry
+from rich import box
+from rich.table import Table
+from rich.text import Text
+
+from . import archive, config, ui
+from .compress import pack_bytes, unpack_bytes, unpack_bytes_with_retry
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -29,12 +33,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     local_host TEXT,
     remote_host TEXT,
     tty TEXT,
-    cast_path TEXT NOT NULL,
-    txt_path TEXT,
+    path TEXT NOT NULL,
     cast_size INTEGER,
     exit_code INTEGER,
     pid INTEGER,
-    encrypted INTEGER NOT NULL DEFAULT 0
+    encrypted INTEGER NOT NULL DEFAULT 0,
+    compressed INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_start ON sessions(start_time);
 CREATE INDEX IF NOT EXISTS idx_sessions_remote_host ON sessions(remote_host);
@@ -53,6 +57,16 @@ def _connect() -> sqlite3.Connection:
     if "encrypted" not in existing_cols:
         conn.execute("ALTER TABLE sessions ADD COLUMN encrypted INTEGER NOT NULL DEFAULT 0")
         conn.commit()
+    if "path" not in existing_cols:
+        # Pre-.rec-archive database (see cast_path/txt_path, now retired) --
+        # nullable since old rows need an actual one-off migration (rename
+        # each session's files into a single .rec archive) to populate it,
+        # not something safe to fake up here. New rows always set it.
+        conn.execute("ALTER TABLE sessions ADD COLUMN path TEXT")
+        conn.commit()
+    if "compressed" not in existing_cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN compressed INTEGER NOT NULL DEFAULT 1")
+        conn.commit()
     return conn
 
 
@@ -62,17 +76,17 @@ def insert_pending_session(
     local_host: str | None,
     remote_host: str | None,
     tty: str | None,
-    cast_path: str,
-    txt_path: str | None,
+    path: str,
     pid: int,
     encrypted: bool = False,
+    compressed: bool = True,
 ) -> int:
     conn = _connect()
     cur = conn.execute(
         """INSERT INTO sessions
-           (start_time, local_host, remote_host, tty, cast_path, txt_path, pid, encrypted)
+           (start_time, local_host, remote_host, tty, path, pid, encrypted, compressed)
            VALUES (?,?,?,?,?,?,?,?)""",
-        (start, local_host, remote_host, tty, cast_path, txt_path, pid, int(encrypted)),
+        (start, local_host, remote_host, tty, path, pid, int(encrypted), int(compressed)),
     )
     conn.commit()
     return cur.lastrowid
@@ -95,18 +109,15 @@ def finalize_session(
     conn.commit()
 
 
-def _set_session_crypto_state(session_id: int, *, encrypted: bool, cast_path: str, txt_path: str | None) -> None:
+def _set_session_encrypted(session_id: int, *, encrypted: bool) -> None:
     """Used by decrypt_session/encrypt_session after rewriting a session's
-    files under a new name (with or without the trailing ".enc") -- updates
-    the index to match, so `korec ls`'s ENC column and every read path
-    (which decides whether to even try resolving a key from `encrypted`,
-    not from sniffing the filename) stay in sync with what's really on
-    disk."""
+    `.rec` archive in place -- updates the index to match, so `korec ls`'s
+    ENC column and every read path (which decides whether to even try
+    resolving a key from `encrypted`, not from anything about the
+    filename -- there's nothing to sniff, every session is just
+    `<base>.rec`) stay in sync with what's really on disk."""
     conn = _connect()
-    conn.execute(
-        "UPDATE sessions SET encrypted=?, cast_path=?, txt_path=? WHERE id=?",
-        (int(encrypted), cast_path, txt_path, session_id),
-    )
+    conn.execute("UPDATE sessions SET encrypted=? WHERE id=?", (int(encrypted), session_id))
     conn.commit()
 
 
@@ -146,6 +157,18 @@ def _status(end_time: str | None, exit_code: int | None, pid: int | None) -> str
     return "RUNNING" if _pid_alive(pid) else "KILLED?"
 
 
+def _status_style(status: str) -> str:
+    if status == "RUNNING":
+        return "yellow"
+    if status == "KILLED?":
+        return "bold red"
+    if status == "0":
+        return "green"
+    if status == "?":
+        return "dim"
+    return "red"  # a nonzero exit code, or a negative one -- killed by a signal
+
+
 def print_sessions(*, limit: int = 50, host: str | None = None, since: str | None = None) -> None:
     conn = _connect()
     where, params = [], []
@@ -157,26 +180,73 @@ def print_sessions(*, limit: int = 50, host: str | None = None, since: str | Non
         params.append(since)
     clause = f"WHERE {' AND '.join(where)}" if where else ""
     rows = conn.execute(
-        f"""SELECT id, start_time, duration_sec, remote_host, tty, cast_size, exit_code, end_time, pid, encrypted
+        f"""SELECT id, start_time, duration_sec, remote_host, tty, cast_size, exit_code, end_time, pid, encrypted, compressed
             FROM sessions {clause} ORDER BY start_time DESC LIMIT ?""",
         (*params, limit),
     ).fetchall()
 
-    fmt = "{:<5} {:<26} {:>7} {:<20} {:<12} {:>7} {:>8} {:>3}"
-    print(fmt.format("ID", "START", "DUR(s)", "HOST", "TTY", "SIZE", "STATUS", "ENC"))
-    for id_, start, dur, rhost, tty, size, rc, end_time, pid, encrypted in rows:
+    if not ui.console.is_terminal:
+        # Piped/redirected/captured -- a script (or a test) parsing this
+        # output shouldn't have to deal with ANSI colors or box-drawing
+        # characters, and shouldn't see output shaped differently than it
+        # always has: same fixed-width, whitespace-separated columns as
+        # before, just with COMPRESSED appended at the end.
+        _print_sessions_plain(rows)
+        return
+
+    table = Table(box=box.ROUNDED, header_style="bold", border_style="grey50")
+    table.add_column("ID", style="cyan", justify="right")
+    table.add_column("START")
+    table.add_column("DUR(s)", justify="right")
+    table.add_column("HOST", style="bold magenta")
+    table.add_column("TTY", style="dim")
+    table.add_column("SIZE", justify="right")
+    table.add_column("STATUS", justify="right")
+    table.add_column("ENC", justify="center")
+    table.add_column("COMPRESSED", justify="center")
+
+    for id_, start, dur, rhost, tty, size, rc, end_time, pid, encrypted, compressed in rows:
+        status = _status(end_time, rc, pid)
+        table.add_row(
+            str(id_), start or "", str(dur) if dur is not None else "-", rhost or "", tty or "",
+            _human_size(size),
+            Text(status, style=_status_style(status)),
+            Text("✓", style="green") if encrypted else Text("-", style="dim"),
+            Text("✓", style="cyan") if compressed else Text("-", style="dim"),
+        )
+    ui.console.print(table)
+
+
+def _print_sessions_plain(rows) -> None:
+    fmt = "{:<5} {:<26} {:>7} {:<20} {:<12} {:>7} {:>8} {:>3} {:>10}"
+    print(fmt.format("ID", "START", "DUR(s)", "HOST", "TTY", "SIZE", "STATUS", "ENC", "COMPRESSED"))
+    for id_, start, dur, rhost, tty, size, rc, end_time, pid, encrypted, compressed in rows:
         dur_display = dur if dur is not None else "-"
         print(fmt.format(id_, start or "", dur_display, rhost or "", tty or "",
-                          _human_size(size), _status(end_time, rc, pid), "*" if encrypted else ""))
+                          _human_size(size), _status(end_time, rc, pid),
+                          "*" if encrypted else "", "*" if compressed else ""))
 
 
 def print_session(session_id: int) -> None:
     row = get_session(session_id)
     if row is None:
         sys.exit(f"korec: session {session_id} not found")
-    for key in row.keys():
-        print(f"{key}: {row[key]}")
-    print(f"status: {_status(row['end_time'], row['exit_code'], row['pid'])}")
+    status = _status(row["end_time"], row["exit_code"], row["pid"])
+
+    if not ui.console.is_terminal:
+        for key in row.keys():
+            print(f"{key}: {row[key]}")
+        print(f"status: {status}")
+        return
+
+    def value(key: str):
+        if key in ("encrypted", "compressed"):
+            return Text("✓", style="green" if key == "encrypted" else "cyan") if row[key] else Text("-", style="dim")
+        return str(row[key])
+
+    kv = [(key, value(key)) for key in row.keys()]
+    kv.append(("status", Text(status, style=_status_style(status))))
+    ui.print_kv_table(kv)
 
 
 def _parse_transcript_line(line: str) -> tuple[float | None, str]:
@@ -205,35 +275,40 @@ def _format_ts(start_iso: str, elapsed: float | None) -> str:
 
 def _live_transcript(row: sqlite3.Row) -> str | None:
     """Render whatever a still-recording session has captured so far,
-    instead of the rendered .txt sidecar -- which only gets built once the
-    session ends. Mirrors what the background `_render` step does, just
-    synchronously and against a possibly mid-line stream.
+    instead of the rendered "txt" archive member -- which only gets built
+    (and appended, see archive.py) once the session ends. Mirrors what the
+    background `_render` step does, just synchronously and against a
+    possibly mid-line stream.
 
-    A running session has no `.cast.zst[.enc]` yet -- asciinema writes
+    A running session has no `.rec` archive yet -- asciinema writes
     straight to the plain, uncompressed file at
-    `recorder.raw_cast_path(cast_path)`, which only gets compressed (and,
-    if configured, encrypted) into `cast_path` once `record()` finishes
-    (see recorder.py). Read that instead when the compressed one isn't
-    there yet -- note it's always plaintext, regardless of the session's
-    `encrypted` flag, since asciinema itself writes it and has no idea
-    korec might encrypt the final artifact.
+    `recorder.raw_cast_path(path)`, which only gets packed into the "cast"
+    member of `path` once `record()` finishes (see recorder.py). Read that
+    instead when the archive isn't there yet -- note it's always
+    plaintext, regardless of the session's `compressed`/`encrypted` flags,
+    since asciinema itself writes it and has no idea korec might transform
+    the final artifact.
 
     Returns None if nothing usable has been flushed to disk yet."""
     from .recorder import raw_cast_path, sanitize_cast_data
     from .render import render_raw_cast
 
-    cast_path = row["cast_path"]
-    p = Path(cast_path)
+    path = row["path"]
+    p = Path(path)
     try:
         if p.exists():
+            blob = archive.read_member(p, "cast")
             if row["encrypted"]:
-                raw = decrypt_file_with_retry(p, config.resolve_password(), f"session {row['id']}")
+                raw = unpack_bytes_with_retry(
+                    blob, compressed=row["compressed"], password=config.resolve_password(),
+                    label=f"session {row['id']}",
+                )
                 if raw is None:
                     return None
             else:
-                raw = decompress_file(p)
+                raw = unpack_bytes(blob, compressed=row["compressed"])
         else:
-            raw_p = raw_cast_path(cast_path)
+            raw_p = raw_cast_path(path)
             if not raw_p.exists():
                 return None
             raw = raw_p.read_bytes()
@@ -242,28 +317,35 @@ def _live_transcript(row: sqlite3.Row) -> str | None:
             return None
         return render_raw_cast(data.decode("utf-8", "replace"))
     except Exception as e:
-        print(f"korec: couldn't render live transcript for {cast_path}: {e}", file=sys.stderr)
+        print(f"korec: couldn't render live transcript for {path}: {e}", file=sys.stderr)
         return None
 
 
 def _session_text(row: sqlite3.Row) -> str | None:
     """This session's rendered transcript (tab-timestamped, one line per
-    output line) -- live-rendered from the cast file if it's still
-    recording, otherwise read from the finished .txt sidecar. Prompts for
+    output line) -- live-rendered from the cast member if it's still
+    recording, otherwise read from the "txt" archive member. Prompts for
     (and retries) a password itself if the session is encrypted -- see
-    compress.py's decrypt_file_with_retry. None if nothing's available yet
-    either way, or decryption never succeeds."""
+    compress.py's unpack_bytes_with_retry. None if nothing's available yet
+    either way (including a finished session whose background render
+    hasn't caught up -- no "txt" member yet), or decryption never
+    succeeds."""
     if row["end_time"] is None:
         return _live_transcript(row)
-    txt_path = row["txt_path"]
-    if not txt_path or not Path(txt_path).exists():
+    path = Path(row["path"])
+    if not path.exists():
+        return None
+    blob = archive.read_member(path, "txt")
+    if blob is None:
         return None
     if not row["encrypted"]:
         try:
-            return decompress_file(Path(txt_path)).decode("utf-8", "ignore")
+            return unpack_bytes(blob, compressed=row["compressed"]).decode("utf-8", "ignore")
         except Exception:
             return None
-    raw = decrypt_file_with_retry(Path(txt_path), config.resolve_password(), f"session {row['id']}")
+    raw = unpack_bytes_with_retry(
+        blob, compressed=row["compressed"], password=config.resolve_password(), label=f"session {row['id']}",
+    )
     return raw.decode("utf-8", "ignore") if raw is not None else None
 
 
@@ -322,7 +404,7 @@ def grep_sessions(pattern: str, *, regex: bool = False, max_lines: int = 5, sess
                 "searching what's been captured so far",
                 file=sys.stderr,
             )
-        source = row["cast_path"] if live else row["txt_path"]
+        source = row["path"]
 
         matches = []
         for raw_line in text.splitlines():
@@ -367,72 +449,58 @@ def print_transcript(session_id: int) -> None:
         print(f"[{_format_ts(start, elapsed)}] {content}")
 
 
-def _strip_enc_suffix(p: Path) -> Path:
-    return p.with_suffix("") if p.suffix == ".enc" else p
+def _rewrite_session_archive(session_id: int, row: sqlite3.Row, *, write_password: str | None) -> None:
+    """Shared machinery for decrypt_session/encrypt_session: reads each
+    member of a session's `.rec` archive -- decrypting, with an
+    interactive retry-on-wrong-password (see compress.py's
+    unpack_bytes_with_retry), if `row["encrypted"]`; reading as plain
+    otherwise. Note this is NOT the same thing as "a password happens to
+    be resolvable" -- a session that genuinely has no password available
+    yet still needs the encrypted read path (so unpack_bytes_with_retry
+    gets a chance to prompt), while a session that isn't encrypted at all
+    must never be run through decryption just because some password
+    happens to be lying around.
 
-
-def _add_enc_suffix(p: Path) -> Path:
-    return p if p.suffix == ".enc" else p.with_name(p.name + ".enc")
-
-
-def _rewrite_session_files(
-    session_id: int, row: sqlite3.Row, *, write_password: str | None, rename: Callable[[Path], Path],
-) -> None:
-    """Shared machinery for decrypt_session/encrypt_session: read each of a
-    session's existing files -- decrypting, with an interactive retry-on-
-    wrong-password (see compress.py's decrypt_file_with_retry), if
-    `row["encrypted"]`; reading as plain otherwise. Note this is NOT the
-    same thing as "a password happens to be resolvable" -- a session that
-    genuinely has no password available yet still needs the encrypted
-    read path (so decrypt_file_with_retry gets a chance to prompt), while
-    a session that isn't encrypted at all must never be run through
-    decryption just because some password happens to be lying around.
-
-    Writes each file back out under `rename(original_path)`, encrypted
-    with `write_password` if given, plain otherwise, then removes the old
-    file if the name actually changed. Only touches files that exist -- a
-    session's .txt.zst[.enc] sidecar may not be built yet."""
-    cast_path = Path(row["cast_path"])
-    txt_path = Path(row["txt_path"]) if row["txt_path"] else None
-    new_cast_path = rename(cast_path)
-    new_txt_path = rename(txt_path) if txt_path is not None else None
+    Rebuilds the archive from scratch at the same path -- unlike the old
+    per-file `.enc`-suffix scheme, encrypting/decrypting a session no
+    longer renames anything, just changes what's inside. Compression
+    (`row["compressed"]`) is untouched either way; only the write
+    password changes. Only rewrites a "txt" member if one already
+    exists -- a session's transcript may not be built yet."""
+    path = Path(row["path"])
     read_password = config.resolve_password() if row["encrypted"] else None
 
-    def read(path: Path) -> bytes:
+    def read(name: str) -> bytes:
+        blob = archive.read_member(path, name)
         if not row["encrypted"]:
-            return decompress_file(path)
-        raw = decrypt_file_with_retry(path, read_password, f"session {session_id}")
+            return unpack_bytes(blob, compressed=row["compressed"])
+        raw = unpack_bytes_with_retry(
+            blob, compressed=row["compressed"], password=read_password, label=f"session {session_id}",
+        )
         if raw is None:
             sys.exit(f"korec: giving up on session {session_id} -- couldn't decrypt {path}")
         return raw
 
-    if cast_path.exists():
-        raw = read(cast_path)
-        compress_bytes_to_file(raw, new_cast_path, password=write_password)
-        if new_cast_path != cast_path:
-            cast_path.unlink()
+    def pack(data: bytes) -> bytes:
+        return pack_bytes(data, compress=row["compressed"], password=write_password)
 
-    if txt_path is not None and txt_path.exists():
-        raw = read(txt_path)
-        compress_bytes_to_file(raw, new_txt_path, password=write_password)
-        if new_txt_path != txt_path:
-            txt_path.unlink()
+    has_txt = archive.has_member(path, "txt")
+    new_cast = pack(read("cast"))
+    new_txt = pack(read("txt")) if has_txt else None
 
-    _set_session_crypto_state(
-        session_id,
-        encrypted=write_password is not None,
-        cast_path=str(new_cast_path),
-        txt_path=str(new_txt_path) if new_txt_path is not None else None,
-    )
+    archive.create(path, "cast", new_cast)
+    if new_txt is not None:
+        archive.append(path, "txt", new_txt)
+
+    _set_session_encrypted(session_id, encrypted=write_password is not None)
 
 
 def decrypt_session(session_id: int) -> None:
-    """Permanently decrypts an encrypted session's stored files in place:
-    rewrites `*.cast.zst.enc`/`*.txt.zst.enc` as plain `*.cast.zst`/
-    `*.txt.zst` (dropping the `.enc`), and clears the session's `encrypted`
-    flag in the index -- no password needed to read it, ever again. There's
-    no undo built into this specific direction; re-encrypt with
-    `encrypt_session` if you want it back."""
+    """Permanently decrypts an encrypted session's `.rec` archive in
+    place, and clears the session's `encrypted` flag in the index -- no
+    password needed to read it, ever again. There's no undo built into
+    this specific direction; re-encrypt with `encrypt_session` if you
+    want it back."""
     row = get_session(session_id)
     if row is None:
         sys.exit(f"korec: session {session_id} not found")
@@ -444,15 +512,88 @@ def decrypt_session(session_id: int) -> None:
             "on disk yet to decrypt (it'll be encrypted once the session finishes)"
         )
 
-    _rewrite_session_files(session_id, row, write_password=None, rename=_strip_enc_suffix)
+    _rewrite_session_archive(session_id, row, write_password=None)
     print(f"korec: session {session_id} decrypted in place -- no password needed for it anymore")
+
+
+def _delete_session_files(row: sqlite3.Row) -> None:
+    """Removes every file on disk for one session: its `.rec` archive,
+    plus -- for a session that never finished -- the plain raw file
+    asciinema was writing to (see recorder.raw_cast_path). Best-effort: a
+    file that's already gone (partial prior cleanup) is not an error."""
+    from .recorder import raw_cast_path
+
+    Path(row["path"]).unlink(missing_ok=True)
+    raw_cast_path(row["path"]).unlink(missing_ok=True)
+
+
+def delete_session(session_id: int, *, force: bool = False) -> None:
+    """Permanently deletes one session: its files (see
+    _delete_session_files) and its row in the index. Refuses a session
+    that's still actively recording (its pid is alive) unless
+    `force=True` -- deleting its files out from under a live asciinema
+    process would corrupt whatever it's still writing. A session whose
+    recorder already died (`KILLED?` in `korec ls`) is fair game either
+    way -- that's exactly the kind of orphaned recording this is meant to
+    clean up (see recorder.py's SIGTERM/SIGHUP handling)."""
+    row = get_session(session_id)
+    if row is None:
+        sys.exit(f"korec: session {session_id} not found")
+    if row["end_time"] is None and _pid_alive(row["pid"]) and not force:
+        sys.exit(
+            f"korec: session {session_id} is still recording (pid {row['pid']} alive) -- "
+            "stop it first, or pass --force to delete it anyway"
+        )
+
+    _delete_session_files(row)
+    conn = _connect()
+    conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+    conn.commit()
+
+
+def all_session_ids() -> list[int]:
+    conn = _connect()
+    return [r[0] for r in conn.execute("SELECT id FROM sessions ORDER BY id")]
+
+
+def delete_all_sessions(*, force: bool = False) -> tuple[int, int]:
+    """Deletes every session's files and row, skipping (unless
+    `force=True`) ones still actively recording. Returns
+    (deleted_count, skipped_running_count). Confirmation is the CLI
+    layer's job (close to the user's terminal), not this function's.
+
+    Also resets the `id` autoincrement counter, but only when the table
+    ends up completely empty (nothing was skipped) -- `id` is
+    `INTEGER PRIMARY KEY AUTOINCREMENT`, so SQLite otherwise keeps handing
+    out ever-higher ids forever even once every row is gone. Resetting it
+    when a skipped (still-recording) session survives would risk a future
+    insert reusing that session's own id."""
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT * FROM sessions").fetchall()
+
+    deleted_ids = []
+    skipped = 0
+    for row in rows:
+        if row["end_time"] is None and _pid_alive(row["pid"]) and not force:
+            skipped += 1
+            continue
+        _delete_session_files(row)
+        deleted_ids.append(row["id"])
+
+    if deleted_ids:
+        placeholders = ",".join("?" * len(deleted_ids))
+        conn.execute(f"DELETE FROM sessions WHERE id IN ({placeholders})", deleted_ids)
+        if not skipped:
+            conn.execute("DELETE FROM sqlite_sequence WHERE name='sessions'")
+        conn.commit()
+    return len(deleted_ids), skipped
 
 
 def encrypt_session(session_id: int) -> None:
     """The mirror of decrypt_session: encrypts a currently-plain session's
-    stored files in place with the configured password, renaming them to
-    `*.cast.zst.enc`/`*.txt.zst.enc` and setting the session's `encrypted`
-    flag."""
+    `.rec` archive in place with the configured password, and sets the
+    session's `encrypted` flag."""
     row = get_session(session_id)
     if row is None:
         sys.exit(f"korec: session {session_id} not found")
@@ -468,5 +609,5 @@ def encrypt_session(session_id: int) -> None:
             "so korec can prompt"
         )
 
-    _rewrite_session_files(session_id, row, write_password=password, rename=_add_enc_suffix)
+    _rewrite_session_archive(session_id, row, write_password=password)
     print(f"korec: session {session_id} encrypted in place")

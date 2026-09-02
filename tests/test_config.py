@@ -82,6 +82,30 @@ def test_set_encryption_store_password_false_clears_it_explicitly():
     assert config.encryption_stored_password() is None
 
 
+# --- optional compression --------------------------------------------------
+
+def test_compression_enabled_by_default():
+    assert config.compression_enabled() is True
+
+
+def test_set_compression_disabled():
+    config.set_compression(False)
+    assert config.compression_enabled() is False
+
+
+def test_set_compression_re_enabled():
+    config.set_compression(False)
+    config.set_compression(True)
+    assert config.compression_enabled() is True
+
+
+def test_compression_setting_independent_of_encryption():
+    config.set_compression(False)
+    config.set_encryption(enabled=True, password="hunter2", store_password=True)
+    assert config.compression_enabled() is False
+    assert config.encryption_enabled() is True
+
+
 # --- password resolution ---------------------------------------------------
 
 def test_resolve_password_from_env_var(monkeypatch):

@@ -125,6 +125,27 @@ def set_encryption(*, enabled: bool, password: str | None = None, store_password
     _save_config(cfg)
 
 
+# --- optional compression -----------------------------------------------
+#
+# On by default. Unlike encryption there's no secret to manage here, just
+# a plain on/off switch -- disable it only for raw throughput (skips the
+# zstd pass entirely), e.g. a very high-output session on a slow machine
+# where compression itself becomes the bottleneck. A session's own
+# `compressed` flag in the index records which way it was actually
+# written, independent of whatever this is set to later.
+
+def compression_enabled() -> bool:
+    return bool(_load_config().get("compression", {}).get("enabled", True))
+
+
+def set_compression(enabled: bool) -> None:
+    cfg = _load_config()
+    comp = cfg.get("compression", {})
+    comp["enabled"] = enabled
+    cfg["compression"] = comp
+    _save_config(cfg)
+
+
 def resolve_password(*, prompt_if_missing: bool = True) -> str | None:
     """Resolution order: $KORECORD_PASSWORD env var (scripting/CI), the
     config file (if `korec config encryption enable` stored it there), then

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 
-from korecord.compress import compress_bytes_to_file, decompress_file
-from korecord.render import render_cast_to_text, render_raw_cast
+from korecord import archive
+from korecord.compress import pack_bytes, unpack_bytes
+from korecord.render import render_cast_member_to_txt, render_raw_cast
 
 
 def make_cast(events, width=80, height=24):
@@ -84,23 +85,39 @@ def test_malformed_private_csi_sgr_sequence_is_skipped_not_fatal():
     assert contents == ["before", "after"]
 
 
-def test_render_cast_to_text_survives_corrupt_cast_file(tmp_path):
-    cast_path = tmp_path / "bad.cast.zst"
-    cast_path.write_bytes(b"this is not a valid zstd stream")
-    txt_path = tmp_path / "out.txt.zst"
-    render_cast_to_text(cast_path, txt_path)  # must not raise
-    assert decompress_file(txt_path) == b""
+def test_render_cast_member_to_txt_survives_corrupt_cast_member(tmp_path):
+    path = tmp_path / "bad.rec"
+    archive.create(path, "cast", b"this is not a valid zstd stream")
+    render_cast_member_to_txt(path, compressed=True)  # must not raise
+    assert unpack_bytes(archive.read_member(path, "txt")) == b""
 
 
-def test_render_cast_to_text_roundtrip(tmp_path):
+def test_render_cast_member_to_txt_roundtrip(tmp_path):
     raw = make_cast([(0.0, "o", "hi there\r\n")])
-    cast_path = tmp_path / "in.cast.zst"
-    compress_bytes_to_file(raw.encode(), cast_path)
-    txt_path = tmp_path / "out.txt.zst"
-    render_cast_to_text(cast_path, txt_path)
-    text = decompress_file(txt_path).decode()
+    path = tmp_path / "in.rec"
+    archive.create(path, "cast", pack_bytes(raw.encode()))
+    render_cast_member_to_txt(path, compressed=True)
+    text = unpack_bytes(archive.read_member(path, "txt")).decode()
     assert "hi there" in text
     assert "\t" in text  # tab-separated timestamp prefix made it into the sidecar
+
+
+def test_render_cast_member_to_txt_uncompressed(tmp_path):
+    raw = make_cast([(0.0, "o", "hi there\r\n")])
+    path = tmp_path / "in.rec"
+    archive.create(path, "cast", pack_bytes(raw.encode(), compress=False))
+    render_cast_member_to_txt(path, compressed=False)
+    text = unpack_bytes(archive.read_member(path, "txt"), compressed=False).decode()
+    assert "hi there" in text
+
+
+def test_render_cast_member_to_txt_encrypted(tmp_path):
+    raw = make_cast([(0.0, "o", "secret line\r\n")])
+    path = tmp_path / "in.rec"
+    archive.create(path, "cast", pack_bytes(raw.encode(), password="hunter2"))
+    render_cast_member_to_txt(path, compressed=True, password="hunter2")
+    text = unpack_bytes(archive.read_member(path, "txt"), password="hunter2").decode()
+    assert "secret line" in text
 
 
 # --- regression: every visible line used to get the *last* event's

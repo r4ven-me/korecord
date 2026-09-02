@@ -10,8 +10,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from . import config, db
-from .compress import compress_bytes_to_file, decompress_file, decrypt_file_with_retry
+from . import archive, config, db
+from .compress import pack_bytes, unpack_bytes, unpack_bytes_with_retry
 
 MIN_ASCIINEMA_MAJOR = 3
 
@@ -110,23 +110,20 @@ def tty_name() -> str:
     return "notty"
 
 
-def raw_cast_path(cast_path: Path | str) -> Path:
+def raw_cast_path(path: Path | str) -> Path:
     """The plain, uncompressed file asciinema writes to directly while a
-    session is recording -- `cast_path` with its ".zst" (and, for an
-    encrypted session, its trailing ".enc") suffix stripped. asciinema 3.x
-    requires a real file path (no more streaming to stdout), so this is
-    what actually gets written live; it only exists for the duration of
-    the recording, and is deleted once `record()` compresses (and, if
-    enabled, encrypts) it into `cast_path` at the end. A session that's
-    still running (or one whose compression step never got to run because
-    `korec record` itself died first) is found here instead -- always
-    plain, never encrypted, regardless of the session's `encrypted` flag,
-    since asciinema itself writes it directly and has no idea korec might
-    encrypt the finished artifact."""
-    p = Path(cast_path)
-    if p.suffix == ".enc":
-        p = p.with_suffix("")
-    return p.with_suffix("")
+    session is recording -- `path` (the session's eventual `.rec` archive
+    location) with that suffix swapped for `.cast`. asciinema 3.x requires
+    a real file path (no more streaming to stdout), so this is what
+    actually gets written live; it only exists for the duration of the
+    recording, and is deleted once `record()` packs it into the "cast"
+    member of `path`'s archive at the end. A session that's still running
+    (or one whose packing step never got to run because `korec record`
+    itself died first) is found here instead -- always plain, never
+    compressed or encrypted regardless of the session's flags, since
+    asciinema itself writes it directly and has no idea korec might
+    transform the finished artifact."""
+    return Path(path).with_suffix(".cast")
 
 
 def _descendant_pids(pid: int) -> list[int]:
@@ -195,7 +192,7 @@ def record(command: list[str], label: str | None = None) -> int:
     session_label = sanitize(label) if label else default_label(command)
     tty = tty_name()
     start = datetime.now().astimezone()
-    root = config.data_dir() / session_label / f"{start:%Y}" / f"{start:%m}"
+    root = config.data_dir() / session_label / f"{start:%Y}" / f"{start:%m}" / f"{start:%d}"
     root.mkdir(parents=True, exist_ok=True)
 
     # Resolved once, up front, in this (foreground, interactive-capable)
@@ -213,6 +210,7 @@ def record(command: list[str], label: str | None = None) -> int:
                 "password is available -- set $KORECORD_PASSWORD, store one via `korec "
                 "config encryption enable`, or run this interactively so korec can prompt"
             )
+    compressed = config.compression_enabled()
 
     # The pid suffix guarantees uniqueness even when two sessions start in
     # the same second on the same tty name -- which real, distinct ptys
@@ -220,13 +218,11 @@ def record(command: list[str], label: str | None = None) -> int:
     # when invoked from a script/cron) could, and a filename collision
     # there would silently overwrite one session's recording with another's.
     base = f"{start:%Y-%m-%d_%H%M%S}_{tty}_{os.getpid()}"
-    # An extra ".enc" makes encrypted recordings identifiable straight from
-    # a file listing (backup tooling, `ls`, ...) without needing to consult
-    # the index -- and is exactly what tells `raw_cast_path()` to strip it.
-    enc_suffix = ".enc" if encrypted else ""
-    cast_path = root / f"{base}.cast.zst{enc_suffix}"
-    txt_path = root / f"{base}.txt.zst{enc_suffix}"
-    raw_path = raw_cast_path(cast_path)
+    # A session's format (compressed and/or encrypted) lives in the index
+    # (`compressed`/`encrypted` below), not the filename -- every session
+    # is just `<base>.rec` regardless.
+    path = root / f"{base}.rec"
+    raw_path = raw_cast_path(path)
 
     # Inserted *before* recording starts (end_time/exit_code left NULL), so
     # a session already shows up in `korec ls` while it's still running --
@@ -239,10 +235,10 @@ def record(command: list[str], label: str | None = None) -> int:
         local_host=local_host,
         remote_host=session_label,
         tty=tty,
-        cast_path=str(cast_path),
-        txt_path=str(txt_path),
+        path=str(path),
         pid=os.getpid(),
         encrypted=encrypted,
+        compressed=compressed,
     )
 
     asciinema = find_asciinema()
@@ -286,28 +282,32 @@ def record(command: list[str], label: str | None = None) -> int:
 
     # asciinema flushes every event to `raw_path` as it happens (confirmed:
     # output shows up within the same second it's produced), so by the time
-    # `record` above returns there's nothing left to stream -- just turn
-    # the finished raw file into the zstd-compressed artifact everything
-    # else (grep, cat, play) expects, then drop the plain copy.
+    # `record` above returns there's nothing left to stream -- just pack
+    # the finished raw file into `path`'s "cast" member (see archive.py),
+    # then drop the plain copy. This makes the session playable
+    # immediately -- the "txt" member (built below, in the background) can
+    # take much longer for a large session, and must not hold that up.
     if raw_path.exists():
         try:
-            compress_bytes_to_file(raw_path.read_bytes(), cast_path, password=password)
-            cast_size = cast_path.stat().st_size
+            archive.create(path, "cast", pack_bytes(raw_path.read_bytes(), compress=compressed, password=password))
+            cast_size = path.stat().st_size
         finally:
             raw_path.unlink(missing_ok=True)
     else:
         cast_size = 0
 
     # Detached (own session, like `setsid`) so it survives the terminal
-    # closing right after the recorded command exits. `--encrypted` tells
-    # it definitively whether to encrypt the transcript -- NOT whether a
-    # password happens to be resolvable, since $KORECORD_PASSWORD could be
-    # sitting in the ambient environment for unrelated reasons and using
-    # that alone would risk wrongly encrypting a plain session. The
-    # password itself, when needed, travels via that same env var (reusing
-    # the one `resolve_password()` already checks first everywhere else),
-    # not argv, so it doesn't show up in `ps`/process listings.
-    render_cmd = [sys.executable, "-m", "korecord", "_render", str(cast_path), str(txt_path)]
+    # closing right after the recorded command exits. `--encrypted`/
+    # `--compressed` tell it definitively how to read the "cast" member
+    # and write the "txt" one -- NOT whether a password happens to be
+    # resolvable, since $KORECORD_PASSWORD could be sitting in the ambient
+    # environment for unrelated reasons and using that alone would risk
+    # wrongly encrypting a plain session. The password itself, when
+    # needed, travels via that same env var (reusing the one
+    # `resolve_password()` already checks first everywhere else), not
+    # argv, so it doesn't show up in `ps`/process listings.
+    render_cmd = [sys.executable, "-m", "korecord", "_render", str(path)]
+    render_cmd.append("--compressed" if compressed else "--no-compressed")
     render_env = None
     if encrypted:
         render_cmd.append("--encrypted")
@@ -370,22 +370,26 @@ def play(session_id: int) -> None:
     row = db.get_session(session_id)
     if row is None:
         sys.exit(f"korec: session {session_id} not found")
-    cast_path = Path(row["cast_path"])
-    if cast_path.exists():
+    path = Path(row["path"])
+    if path.exists():
+        blob = archive.read_member(path, "cast")
         if row["encrypted"]:
-            raw = decrypt_file_with_retry(cast_path, config.resolve_password(), f"session {session_id}")
+            raw = unpack_bytes_with_retry(
+                blob, compressed=row["compressed"], password=config.resolve_password(),
+                label=f"session {session_id}",
+            )
             if raw is None:
                 sys.exit(f"korec: couldn't decrypt session {session_id}")
         else:
-            raw = decompress_file(cast_path)
+            raw = unpack_bytes(blob, compressed=row["compressed"])
     else:
         # The plain file asciinema writes to live, during an active
-        # recording -- always unencrypted regardless of the session's
-        # `encrypted` flag, since asciinema itself writes it directly and
-        # has no idea korec encrypts the finished artifact.
-        raw_path = raw_cast_path(cast_path)
+        # recording -- always uncompressed and unencrypted regardless of
+        # the session's flags, since asciinema itself writes it directly
+        # and has no idea korec transforms the finished artifact.
+        raw_path = raw_cast_path(path)
         if not raw_path.exists():
-            sys.exit(f"korec: {cast_path} is missing")
+            sys.exit(f"korec: {path} is missing")
         raw = raw_path.read_bytes()
     if row["end_time"] is None:
         print(f"korec: session {session_id} is still recording -- playing back what's been written so far", file=sys.stderr)

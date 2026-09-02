@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from korecord import config, db
-from korecord.compress import compress_bytes_to_file
+from korecord import archive, config, db
+from korecord.compress import pack_bytes
 from korecord.recorder import (
     _asciinema_major_version,
     _descendant_pids,
@@ -115,17 +115,9 @@ def test_sanitize_cast_data_trims_incomplete_tail_line(capsys):
 
 # --- raw_cast_path -----------------------------------------------------------
 
-def test_raw_cast_path_strips_zst_suffix():
-    assert raw_cast_path("/data/foo/bar.cast.zst") == Path("/data/foo/bar.cast")
-    assert raw_cast_path(Path("/data/foo/bar.cast.zst")) == Path("/data/foo/bar.cast")
-
-
-def test_raw_cast_path_strips_enc_and_zst_suffix_for_encrypted_sessions():
-    """An encrypted session's cast file is named "*.cast.zst.enc" -- the
-    raw file underneath (what asciinema actually writes live, always
-    plain) is still just "*.cast", same as an unencrypted session's."""
-    assert raw_cast_path("/data/foo/bar.cast.zst.enc") == Path("/data/foo/bar.cast")
-    assert raw_cast_path(Path("/data/foo/bar.cast.zst.enc")) == Path("/data/foo/bar.cast")
+def test_raw_cast_path_swaps_rec_suffix_for_cast():
+    assert raw_cast_path("/data/foo/bar.rec") == Path("/data/foo/bar.cast")
+    assert raw_cast_path(Path("/data/foo/bar.rec")) == Path("/data/foo/bar.cast")
 
 
 # --- asciinema discovery/version gate ----------------------------------------
@@ -231,17 +223,15 @@ def test_find_asciinema_finds_the_real_installed_binary():
 # --- play() + encryption ------------------------------------------------
 
 def _insert_finished_session(tmp_path, *, cast_bytes=b"unused cast bytes", password=None, encrypted=False):
-    suffix = ".enc" if encrypted else ""
-    cast_path = tmp_path / f"c.cast.zst{suffix}"
-    txt_path = tmp_path / f"c.txt.zst{suffix}"
-    compress_bytes_to_file(cast_bytes, cast_path, password=password)
+    path = tmp_path / "c.rec"
+    archive.create(path, "cast", pack_bytes(cast_bytes, password=password))
     sid = db.insert_pending_session(
         start="2026-01-01T10:00:00+00:00", local_host="l", remote_host="r",
-        tty="t", cast_path=str(cast_path), txt_path=str(txt_path), pid=os.getpid(),
+        tty="t", path=str(path), pid=os.getpid(),
         encrypted=encrypted,
     )
     db.finalize_session(sid, end="2026-01-01T10:01:00+00:00", duration=60, cast_size=1, exit_code=0)
-    return sid, cast_path
+    return sid, path
 
 
 def test_play_not_found_exits():
@@ -292,8 +282,8 @@ def test_play_encrypted_session_missing_cast_file_exits(tmp_path):
     but the cast file itself is gone -- must still fail cleanly, not with
     a confusing decryption error about a file that isn't there."""
     config.set_encryption(enabled=True, password="hunter2", store_password=True)
-    sid, cast_path = _insert_finished_session(tmp_path, password="hunter2", encrypted=True)
-    cast_path.unlink()
+    sid, path = _insert_finished_session(tmp_path, password="hunter2", encrypted=True)
+    path.unlink()
     with pytest.raises(SystemExit):
         play(sid)
 

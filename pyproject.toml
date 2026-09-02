@@ -22,6 +22,8 @@ classifiers = [
 dependencies = [
     "cryptography>=41",
     "pyte>=0.8",
+    "rich>=13",
+    "rich-argparse>=1",
     "zstandard>=0.22",
 ]
 
