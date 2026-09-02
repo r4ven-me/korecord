@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "korecord"
-version = "0.1.0"
+version = "0.1.1"
 description = "Permanent, compressed, searchable recording of terminal sessions (ssh and beyond), built on asciinema."
 readme = "README.md"
 requires-python = ">=3.10"
