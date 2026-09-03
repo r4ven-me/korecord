@@ -9,10 +9,26 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+
+      # The two external tools korec shells out to (see README
+      # "Requirements") aren't bundled as Python dependencies and aren't
+      # on a bare runner -- most tests mock asciinema out, but the real
+      # end-to-end ones (and the standalone decrypt-recording.py script's
+      # tests) actually invoke it/zstd for real.
+      - name: Install asciinema
+        run: |
+          mkdir -p ~/.local/bin
+          curl -Lo ~/.local/bin/asciinema \
+            https://github.com/asciinema/asciinema/releases/latest/download/asciinema-x86_64-unknown-linux-gnu
+          chmod +x ~/.local/bin/asciinema
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install zstd
+        run: sudo apt-get update -y && sudo apt-get install -y zstd
+
       - name: Install package and dependencies
         run: pip install -e '.[dev]'
       - name: Tests
